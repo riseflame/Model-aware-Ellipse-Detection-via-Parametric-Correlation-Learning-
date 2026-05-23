@@ -1,4 +1,4 @@
-name: eidet
+name: model-aware-ellipse-detection
 channels:
   - pytorch
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free
@@ -123,4 +123,3 @@ dependencies:
     - wandb==0.13.11
     - yapf==0.33.0
     - zipp==3.11.0
-prefix: /home/liuzezheng/anaconda3/envs/eidet

@@ -11,7 +11,9 @@ from predict import merge_outputs, post_process, pre_process, process
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate EDP2Net/ElDet on COCO-style ellipse annotations.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Model-aware ellipse detection via parametric correlation learning."
+    )
     parser.add_argument("--weights", type=str, required=True, help="model checkpoint path")
     parser.add_argument("--annotations", type=str, required=True, help="COCO annotation json")
     parser.add_argument("--image_dir", type=str, required=True, help="image directory")

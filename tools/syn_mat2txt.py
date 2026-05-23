@@ -1,21 +1,33 @@
-import scipy.io as sio
+import argparse
 import os
-# 加载 .mat 文件
-mat_gt = '/fastersharefiles/liuzezheng/Synthetic Images - Occluded Ellipses/gt'
-files = os.listdir(mat_gt)
-for f in files:
-    path = mat_gt + '/' + str(f)
-    mat_data = sio.loadmat(path)
 
-# 提取数据，假设保存在变量 data 中
-    data = mat_data['ellipse_param']
+import scipy.io as sio
 
-# 将数据保存为 .txt 文件
-    write_path = '/fastersharefiles/liuzezheng/Synthetic Images - Occluded Ellipses/test/'+'s'+str(f)[1:-4]+'.jpg.fled.txt'
-    with open(write_path, 'w') as file:
-        file.write(str(data.shape[1]) + '\n')
-        for i in range(data.shape[1]):
-            column_index = i
-            column_data = [row[column_index] for row in data]
-            row_str = '\t'.join(str(val) for val in column_data)  # 使用制表符分隔每一行的数据
-            file.write(row_str + '\n')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert synthetic ellipse .mat annotations to txt.")
+    parser.add_argument("--mat_dir", required=True, help="directory containing .mat files")
+    parser.add_argument("--output_dir", required=True, help="directory for output txt files")
+    return parser.parse_args()
+
+
+def convert(mat_dir, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    for filename in os.listdir(mat_dir):
+        if not filename.endswith(".mat"):
+            continue
+        path = os.path.join(mat_dir, filename)
+        mat_data = sio.loadmat(path)
+        data = mat_data["ellipse_param"]
+        write_path = os.path.join(output_dir, "s" + filename[1:-4] + ".jpg.fled.txt")
+        with open(write_path, "w") as file:
+            file.write(str(data.shape[1]) + "\n")
+            for i in range(data.shape[1]):
+                column_data = [row[i] for row in data]
+                row_str = "\t".join(str(val) for val in column_data)
+                file.write(row_str + "\n")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    convert(args.mat_dir, args.output_dir)

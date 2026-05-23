@@ -13,7 +13,9 @@ import math
 import torch.nn .functional as F
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run EDP2Net/ElDet inference on a COCO-style dataset.")
+    parser = argparse.ArgumentParser(
+        description="Run Model-aware ellipse detection via parametric correlation learning inference."
+    )
     parser.add_argument("--weights", type=str, required=True, help="model checkpoint path")
     parser.add_argument("--annotations", type=str, required=True, help="COCO annotation json")
     parser.add_argument("--image_dir", type=str, required=True, help="image directory")

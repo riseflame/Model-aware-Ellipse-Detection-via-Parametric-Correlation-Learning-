@@ -14,7 +14,9 @@ from dataset import ctDataset
 
 
 def parse_opt():
-    parser = argparse.ArgumentParser(description="Train EDP2Net/ElDet ellipse detector.")
+    parser = argparse.ArgumentParser(
+        description="Train Model-aware ellipse detection via parametric correlation learning."
+    )
     parser.add_argument("--data", type=str, required=True, help="training data folder")
     parser.add_argument("--val_data", type=str, default=None, help="validation data folder")
     parser.add_argument("--save_path", type=str, default="results/train", help="checkpoint and log directory")
@@ -38,7 +40,7 @@ def parse_opt():
     parser.add_argument("--comp_weight", type=float, default=1, help="compactness loss weight")
 
     parser.add_argument("--use_wandb", action="store_true", help="enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="edp2net", help="wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="model-aware-ellipse-detection", help="wandb project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="wandb run name")
     return parser.parse_args()
 
