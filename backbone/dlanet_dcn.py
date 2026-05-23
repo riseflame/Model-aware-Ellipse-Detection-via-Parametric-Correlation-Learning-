@@ -1,0 +1,841 @@
+# Now using.........
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+import cv2
+import math
+import logging
+import numpy as np
+from os.path import join
+from .crossconv import CrossConv
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.utils.model_zoo as model_zoo
+global edge
+from DCNv2.dcn_v2 import DCN
+from math import log
+BN_MOMENTUM = 0.1
+logger = logging.getLogger(__name__)
+
+
+def get_model_url(data='imagenet', name='dla34', hash='ba72cf86'):
+    return join('http://dl.yf.io/dla/models', data, '{}-{}.pth'.format(name, hash))
+def gaussian2D(shape, sigma=1):
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+    h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
+    h[h < np.finfo(h.dtype).eps * h.max()] = 0
+    return h
+def draw_umich_gaussian(heatmap, center, radius, k=1):
+    diameter = 2 * radius + 1
+    gaussian = gaussian2D((diameter, diameter), sigma=diameter / 6)
+
+    x, y = int(center[0]), int(center[1])
+
+    height, width = heatmap.shape[0:2]
+    left, right = min(x, radius), min(width - x, radius + 1)
+    top, bottom = min(y, radius), min(height - y, radius + 1)
+
+    masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
+    masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
+    if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:  # TODO debug
+        #masked_heatmap = np.array(masked_heatmap.cpu())
+        #np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
+        #masked_gaussian.cuda()
+        #heatmap.cuda()
+        masked_gaussian = torch.tensor(masked_gaussian).cuda()
+        torch.max(masked_heatmap,masked_gaussian,out = masked_heatmap)
+    return heatmap
+#画heat map的函数
+def drawHM(hm):
+    hm = hm.cpu()
+    img = np.zeros((128, 128, 3), np.uint8)
+    hm_up = cv2.resize(hm[0,0,:,:].detach().numpy(), (128,128), interpolation=cv2.INTER_AREA)  
+    alpha = 0.5 # 设置覆盖图片的透明度
+    hm_up = np.expand_dims(hm_up,-1)
+    heat_map = np.concatenate((hm_up,hm_up,hm_up),axis=2)
+    heat_map = (heat_map*255).astype(np.uint8)
+    heat_map = cv2.applyColorMap(heat_map, cv2.COLORMAP_HOT)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (128, 128), (255, 0, 0), -1) # 设置蓝色为热度图基本色蓝色
+    #img = cv2.addWeighted(overlay, alpha, img, 1-alpha, 0) # 将背景热度图覆盖到原图
+    img = cv2.addWeighted(heat_map, alpha, img, 1-alpha, 0) # 将热度图覆盖到原图
+    cv2.imwrite('./results/mask/', img)
+    return img
+
+
+class BasicBlock(nn.Module):
+    def __init__(self, inplanes, planes, stride=1, dilation=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3,
+                               stride=stride, padding=dilation,
+                               bias=False, dilation=dilation)
+        self.bn1 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=dilation,
+                               bias=False, dilation=dilation)
+        self.bn2 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
+        self.stride = stride
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 2
+
+    def __init__(self, inplanes, planes, stride=1, dilation=1):
+        super(Bottleneck, self).__init__()
+        expansion = Bottleneck.expansion
+        bottle_planes = planes // expansion
+        self.conv1 = nn.Conv2d(inplanes, bottle_planes,
+                               kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(bottle_planes, momentum=BN_MOMENTUM)
+        self.conv2 = nn.Conv2d(bottle_planes, bottle_planes, kernel_size=3,
+                               stride=stride, padding=dilation,
+                               bias=False, dilation=dilation)
+        self.bn2 = nn.BatchNorm2d(bottle_planes, momentum=BN_MOMENTUM)
+        self.conv3 = nn.Conv2d(bottle_planes, planes,
+                               kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
+        self.relu = nn.ReLU(inplace=True)
+        self.stride = stride
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class BottleneckX(nn.Module):
+    expansion = 2
+    cardinality = 32
+
+    def __init__(self, inplanes, planes, stride=1, dilation=1):
+        super(BottleneckX, self).__init__()
+        cardinality = BottleneckX.cardinality
+        # dim = int(math.floor(planes * (BottleneckV5.expansion / 64.0)))
+        # bottle_planes = dim * cardinality
+        bottle_planes = planes * cardinality // 32
+        self.conv1 = nn.Conv2d(inplanes, bottle_planes,
+                               kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(bottle_planes, momentum=BN_MOMENTUM)
+        self.conv2 = nn.Conv2d(bottle_planes, bottle_planes, kernel_size=3,
+                               stride=stride, padding=dilation, bias=False,
+                               dilation=dilation, groups=cardinality)
+        self.bn2 = nn.BatchNorm2d(bottle_planes, momentum=BN_MOMENTUM)
+        self.conv3 = nn.Conv2d(bottle_planes, planes,
+                               kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
+        self.relu = nn.ReLU(inplace=True)
+        self.stride = stride
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class Root(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, residual):
+        super(Root, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, 1,
+            stride=1, bias=False, padding=(kernel_size - 1) // 2)
+        self.bn = nn.BatchNorm2d(out_channels, momentum=BN_MOMENTUM)
+        self.relu = nn.ReLU(inplace=True)
+        self.residual = residual
+
+    def forward(self, *x):
+        children = x
+        x = self.conv(torch.cat(x, 1))
+        x = self.bn(x)
+        if self.residual:
+            x += children[0]
+        x = self.relu(x)
+
+        return x
+
+
+class Tree(nn.Module):
+    def __init__(self, levels, block, in_channels, out_channels, stride=1,
+                 level_root=False, root_dim=0, root_kernel_size=1,
+                 dilation=1, root_residual=False):
+        super(Tree, self).__init__()
+        if root_dim == 0:
+            root_dim = 2 * out_channels
+        if level_root:
+            root_dim += in_channels
+        if levels == 1:
+            self.tree1 = block(in_channels, out_channels, stride,
+                               dilation=dilation)
+            self.tree2 = block(out_channels, out_channels, 1,
+                               dilation=dilation)
+        else:
+            self.tree1 = Tree(levels - 1, block, in_channels, out_channels,
+                              stride, root_dim=0,
+                              root_kernel_size=root_kernel_size,
+                              dilation=dilation, root_residual=root_residual)
+            self.tree2 = Tree(levels - 1, block, out_channels, out_channels,
+                              root_dim=root_dim + out_channels,
+                              root_kernel_size=root_kernel_size,
+                              dilation=dilation, root_residual=root_residual)
+        if levels == 1:
+            self.root = Root(root_dim, out_channels, root_kernel_size,
+                             root_residual)
+        self.level_root = level_root
+        self.root_dim = root_dim
+        self.downsample = None
+        self.project = None
+        self.levels = levels
+        if stride > 1:
+            self.downsample = nn.MaxPool2d(stride, stride=stride)
+        if in_channels != out_channels:
+            self.project = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels,
+                          kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(out_channels, momentum=BN_MOMENTUM)
+            )
+
+    def forward(self, x, residual=None, children=None):
+        children = [] if children is None else children
+        bottom = self.downsample(x) if self.downsample else x
+        residual = self.project(bottom) if self.project else bottom
+        if self.level_root:
+            children.append(bottom)
+        x1 = self.tree1(x, residual)
+        if self.levels == 1:
+            x2 = self.tree2(x1)
+            x = self.root(x2, x1, *children)
+        else:
+            children.append(x1)
+            x = self.tree2(x1, children=children)
+        return x
+
+
+class DLA(nn.Module):
+    def __init__(self, levels, channels, num_classes=1000,
+                 block=BasicBlock, residual_root=False, linear_root=False):
+        super(DLA, self).__init__()
+        self.channels = channels
+        self.num_classes = num_classes
+        # 输入图片尺寸
+        self.base_layer = nn.Sequential(
+            nn.Conv2d(3, channels[0], kernel_size=7, stride=1,
+                      padding=3, bias=False),
+            nn.BatchNorm2d(channels[0], momentum=BN_MOMENTUM),
+            nn.ReLU(inplace=True))
+        self.level0 = self._make_conv_level(
+            channels[0], channels[0], levels[0])
+        self.level1 = self._make_conv_level(
+            channels[0], channels[1], levels[1], stride=2)
+        self.level2 = Tree(levels[2], block, channels[1], channels[2], 2,
+                           level_root=False,
+                           root_residual=residual_root)
+        self.level3 = Tree(levels[3], block, channels[2], channels[3], 2,
+                           level_root=True, root_residual=residual_root)
+        self.level4 = Tree(levels[4], block, channels[3], channels[4], 2,
+                           level_root=True, root_residual=residual_root)
+        self.level5 = Tree(levels[5], block, channels[4], channels[5], 2,
+                           level_root=True, root_residual=residual_root)
+
+        # for m in self.modules():
+        #     if isinstance(m, nn.Conv2d):
+        #         n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+        #         m.weight.data.normal_(0, math.sqrt(2. / n))
+        #     elif isinstance(m, nn.BatchNorm2d):
+        #         m.weight.data.fill_(1)
+        #         m.bias.data.zero_()
+
+    def _make_level(self, block, inplanes, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or inplanes != planes:
+            downsample = nn.Sequential(
+                nn.MaxPool2d(stride, stride=stride),
+                nn.Conv2d(inplanes, planes,
+                          kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(planes, momentum=BN_MOMENTUM),
+            )
+
+        layers = []
+        layers.append(block(inplanes, planes, stride, downsample=downsample))
+        for i in range(1, blocks):
+            layers.append(block(inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def _make_conv_level(self, inplanes, planes, convs, stride=1, dilation=1):
+        modules = []
+        for i in range(convs):
+            modules.extend([
+                nn.Conv2d(inplanes, planes, kernel_size=3,
+                          stride=stride if i == 0 else 1,
+                          padding=dilation, bias=False, dilation=dilation),
+                nn.BatchNorm2d(planes, momentum=BN_MOMENTUM),
+                nn.ReLU(inplace=True)])
+            inplanes = planes
+        return nn.Sequential(*modules)
+
+    def forward(self, x):
+        y = []
+        x = self.base_layer(x)
+        for i in range(6):
+            x = getattr(self, 'level{}'.format(i))(x)
+            y.append(x)
+        return y
+
+    def load_pretrained_model(self, data='imagenet', name='dla34', hash='ba72cf86'):
+        # fc = self.fc
+        if name.endswith('.pth'):
+            model_weights = torch.load(data + name)
+        else:
+            model_url = get_model_url(data, name, hash)
+            model_weights = model_zoo.load_url(model_url)
+        num_classes = len(model_weights[list(model_weights.keys())[-1]])
+        self.fc = nn.Conv2d(
+            self.channels[-1], num_classes,
+            kernel_size=1, stride=1, padding=0, bias=True)
+        self.load_state_dict(model_weights)
+        # self.fc = fc
+
+
+def dla34(pretrained=True, **kwargs):  # DLA-34
+    model = DLA([1, 1, 1, 2, 2, 1],
+                [16, 32, 64, 128, 256, 512],
+                block=BasicBlock, **kwargs)
+    if pretrained:
+        model.load_pretrained_model(data='imagenet', name='dla34', hash='ba72cf86')
+    return model
+
+
+class Identity(nn.Module):
+
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, x):
+        return x
+
+
+def fill_fc_weights(layers):
+    for m in layers.modules():
+        if isinstance(m, nn.Conv2d):
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+
+def fill_up_weights(up):
+    w = up.weight.data
+    f = math.ceil(w.size(2) / 2)
+    c = (2 * f - 1 - f % 2) / (2. * f)
+    for i in range(w.size(2)):
+        for j in range(w.size(3)):
+            w[0, 0, i, j] = \
+                (1 - math.fabs(i / f - c)) * (1 - math.fabs(j / f - c))
+    for c in range(1, w.size(0)):
+        w[c, 0, :, :] = w[0, 0, :, :]
+
+
+class DeformConv(nn.Module):
+    def __init__(self, chi, cho):
+        super(DeformConv, self).__init__()
+        self.actf = nn.Sequential(
+            nn.BatchNorm2d(cho, momentum=BN_MOMENTUM),
+            nn.ReLU(inplace=True)
+        )
+        self.conv = DCN(chi, cho, kernel_size=(3, 3), stride=1, padding=1, dilation=1, deformable_groups=1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.actf(x)
+        return x
+
+
+class IDAUp(nn.Module):
+
+    def __init__(self, o, channels, up_f):
+        super(IDAUp, self).__init__()
+        for i in range(1, len(channels)):
+            c = channels[i]
+            f = int(up_f[i])
+            proj = DeformConv(c, o)
+            node = DeformConv(o, o)
+
+            up = nn.ConvTranspose2d(o, o, f * 2, stride=f,
+                                    padding=f // 2, output_padding=0,
+                                    groups=o, bias=False)
+            fill_up_weights(up)
+
+            setattr(self, 'proj_' + str(i), proj)
+            setattr(self, 'up_' + str(i), up)
+            setattr(self, 'node_' + str(i), node)
+
+    def forward(self, layers, startp, endp):
+        for i in range(startp + 1, endp):
+            upsample = getattr(self, 'up_' + str(i - startp))
+            project = getattr(self, 'proj_' + str(i - startp))
+            layers[i] = upsample(project(layers[i]))
+            node = getattr(self, 'node_' + str(i - startp))
+            layers[i] = node(layers[i] + layers[i - 1])
+        #后加的
+        return layers
+
+
+class DLAUp(nn.Module):
+    def __init__(self, startp, channels, scales, in_channels=None):
+        super(DLAUp, self).__init__()
+        self.startp = startp
+        if in_channels is None:
+            in_channels = channels
+        self.channels = channels
+        channels = list(channels)
+        scales = np.array(scales, dtype=int)
+        for i in range(len(channels) - 1):
+            j = -i - 2
+            setattr(self, 'ida_{}'.format(i),
+                    IDAUp(channels[j], in_channels[j:],
+                          scales[j:] // scales[j]))
+            scales[j + 1:] = scales[j]
+            in_channels[j + 1:] = [channels[j] for _ in channels[j + 1:]]
+
+    def forward(self, layers):
+        out = [layers[-1]]  # start with 32
+        for i in range(len(layers) - self.startp - 1):
+            ida = getattr(self, 'ida_{}'.format(i))
+            ida(layers, len(layers) - i - 2, len(layers))
+            out.insert(0, layers[-1])
+        return out
+
+
+class Interpolate(nn.Module):
+    def __init__(self, scale, mode):
+        super(Interpolate, self).__init__()
+        self.scale = scale
+        self.mode = mode
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=self.scale, mode=self.mode, align_corners=False)
+        return x
+
+
+class Creat_DlaNet(nn.Module):
+    def __init__(self, base_name, heads, pretrained, down_ratio, final_kernel,
+                 last_level, head_conv, out_channel=0):
+        super(Creat_DlaNet, self).__init__()
+
+        self.first_level = int(np.log2(down_ratio))
+        self.last_level = last_level
+
+        # globals()[base_name](pretrained=pretrained) 意思是在全局寻找一个叫 base_name 的函数或者类，
+        # 他的参数 pretrained 为 true
+        self.base = globals()[base_name](pretrained=pretrained)
+        channels = self.base.channels
+        scales = [2 ** i for i in range(len(channels[self.first_level:]))]
+        self.dla_up = DLAUp(self.first_level, channels[self.first_level:], scales)
+
+        if out_channel == 0:
+            out_channel = channels[self.first_level]
+
+        self.ida_up = IDAUp(out_channel, channels[self.first_level:self.last_level],
+                            [2 ** i for i in range(self.last_level - self.first_level)])
+
+        self.heads = heads
+        for head in self.heads:
+            classes = self.heads[head]
+            if head_conv > 0:
+                fc = nn.Sequential(
+                    nn.Conv2d(channels[self.first_level], head_conv,
+                              kernel_size=3, padding=1, bias=True),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(head_conv, classes,
+                              kernel_size=final_kernel, stride=1,
+                              padding=final_kernel // 2, bias=True))
+                if 'hm' in head:
+                    fc[-1].bias.data.fill_(-2.19)
+                else:
+                    fill_fc_weights(fc)
+            else:
+                fc = nn.Conv2d(channels[self.first_level], classes,
+                               kernel_size=final_kernel, stride=1,
+                               padding=final_kernel // 2, bias=True)
+                if 'hm' in head:
+                    fc.bias.data.fill_(-2.19)
+                else:
+                    fill_fc_weights(fc)
+            self.__setattr__(head, fc)
+
+    def forward(self, x):
+        x = self.base(x)
+        x = self.dla_up(x)
+
+        y = []
+        for i in range(self.last_level - self.first_level):
+            y.append(x[i].clone())
+        self.ida_up(y, 0, len(y))
+
+        z = {}
+        for head in self.heads:
+            z[head] = self.__getattr__(head)(y[-1])
+        return z
+
+
+def DlaNet(num_layers=34, heads={'hm': 1, 'ab': 2, 'ang': 1, 'reg': 2, 'mask': 1}, head_conv=256):
+    model = Creat_DlaNet('dla{}'.format(num_layers), heads,
+                         pretrained=True,
+                         down_ratio=4,
+                         final_kernel=1,
+                         last_level=5,
+                         head_conv=head_conv)
+    return model
+
+
+class ResBlock(nn.Module):
+    def __init__(self, inchannel, outchannel, stride=1):
+        super(ResBlock, self).__init__()
+        self.left = nn.Sequential(
+            nn.Conv2d(inchannel, outchannel, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(outchannel),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(outchannel, outchannel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(outchannel)
+        )
+        self.shortcut = nn.Sequential()
+        if stride != 1 or inchannel != outchannel:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(inchannel, outchannel, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(outchannel)
+            )
+
+    def forward(self, x):
+        out = self.left(x)
+        out = out + self.shortcut(x)
+        out = F.relu(out)
+
+        return out
+
+
+class ResNet(nn.Module):
+    def __init__(self, ResBlock, num_classes=4):
+        super(ResNet, self).__init__()
+        self.inchannel = 64
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(7, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU()
+        )
+        self.layer1 = self.make_layer(ResBlock, 64, 2, stride=1)
+        self.maxpool1 = nn.AdaptiveMaxPool2d(256)
+        self.layer2 = self.make_layer(ResBlock, 128, 2, stride=2)
+        self.maxpool2 = nn.AdaptiveMaxPool2d(64)
+        self.layer3 = self.make_layer(ResBlock, 256, 2, stride=2)
+        self.maxpool3 = nn.AdaptiveMaxPool2d(16)
+        self.layer4 = self.make_layer(ResBlock, 512, 2, stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(512, num_classes)
+        self.Softmax = nn.Softmax(dim=1)
+
+    def make_layer(self, block, channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.inchannel, channels, stride))
+            self.inchannel = channels
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.maxpool1(out)
+        out = self.layer2(out)
+        out = self.maxpool2(out)
+        out = self.layer3(out)
+        out = self.maxpool3(out)
+        out = self.layer4(out)
+        # out = F.avg_pool2d(out, 4)
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        out = self.Softmax(out)
+        return out
+
+
+class Conv1x1(nn.Module):
+    def __init__(self, inplanes, planes):
+        super(Conv1x1, self).__init__()
+        self.conv = nn.Conv2d(inplanes, planes, 1)
+        self.bn = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+
+        return x
+    
+
+class EAM(nn.Module):
+    def __init__(self):
+        super(EAM, self).__init__()
+        self.reduce1 = Conv1x1(64, 64)
+        self.reduce4 = Conv1x1(512, 256)
+        self.block = nn.Sequential(
+            ConvBNR(256 + 64, 256, 3),
+            ConvBNR(256, 256, 3),
+            nn.Conv2d(256, 1, 1)
+        )
+
+    def forward(self, x4, x1):
+        size = x1.size()[2:]
+        x1 = self.reduce1(x1)
+        x4 = self.reduce4(x4)
+        x4 = F.interpolate(x4, size, mode='bilinear', align_corners=False)
+        out = torch.cat((x4, x1), dim=1)
+        out = self.block(out)
+        return out
+class ESAM(nn.Module):
+    def __init__(self):
+        super(ESAM, self).__init__()
+        self.reduce1 = Conv1x1(64, 64)
+        self.reduce4 = Conv1x1(512, 256)
+        self.block1 = nn.Sequential(
+            ConvBNR(256 + 64, 256, 3),
+            ConvBNR(256, 256, 3),
+            )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(2, 1, 3, padding=1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+        # self.test_block = nn.Sequential(
+        #     nn.Conv2d(256, 1, 3, padding=1, bias=False)
+        # )
+    def forward(self, x4, x1):
+        size = x1.size()[2:]
+        x1 = self.reduce1(x1)
+        x4 = self.reduce4(x4)
+        print("ori")
+        print(x4.shape)
+        x4 = F.interpolate(x4, size, mode='bilinear', align_corners=False)   
+        print(x4.shape)  
+        out = torch.cat((x4, x1), dim=1)
+        out = self.block1(out)
+        avg_out = torch.mean(out, dim=1, keepdim=True)
+        max_out, _ = torch.max(out, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.block2(x)
+        x = self.sigmoid(x)
+        # x = self.test_block(out)
+        # x = self.sigmoid(x)
+        
+        return x
+    
+
+
+class ConvBNR(nn.Module):
+    def __init__(self, inplanes, planes, kernel_size=3, stride=1, dilation=1, bias=False):
+        super(ConvBNR, self).__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(inplanes, planes, kernel_size, stride=stride, padding=dilation, dilation=dilation, bias=bias),
+            nn.BatchNorm2d(planes),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+class EFM(nn.Module):
+    def __init__(self, channel):
+        super(EFM, self).__init__()
+        t = int(abs((log(channel, 2) + 1) / 2))
+        k = t if t % 2 else t + 1
+        self.conv2d = ConvBNR(channel, channel, 3)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, c, att):
+
+        if c.size() != att.size():
+            att = F.interpolate(att, c.size()[2:], mode='bilinear', align_corners=False)
+        x = c + att*c
+        x = self.conv2d(x)
+
+        
+        #wei = self.avg_pool(x)
+        #wei = self.conv1d(wei.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        #wei = self.sigmoid(wei)
+        #x = x * wei
+        
+        return x
+class SEM():
+    def __init__(self, channel):
+        super(SEM, self).__init__()
+        t = int(abs((log(channel, 2) + 1) / 2))
+        k = t if t % 2 else t + 1
+        self.conv2d = ConvBNR(channel, channel, 3)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        wei = self.avg_pool(x)
+        wei = self.conv1d(wei.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        wei = self.sigmoid(wei)
+        x = x * wei
+
+    
+
+
+class Creat_MyNet(nn.Module):
+    def __init__(self, base_name, heads, pretrained, down_ratio, final_kernel,
+                 last_level, head_conv, out_channel=0):
+        super(Creat_MyNet, self).__init__()
+
+        self.first_level = int(np.log2(down_ratio))
+        self.last_level = last_level
+
+        # globals()[base_name](pretrained=pretrained) 意思是在全局寻找一个叫 base_name 的函数或者类，
+        # 他的参数 pretrained 为 true
+        self.base = globals()[base_name](pretrained=pretrained)
+        channels = self.base.channels
+        scales = [2 ** i for i in range(len(channels[self.first_level:]))]
+        self.dla_up = DLAUp(self.first_level, channels[self.first_level:], scales)
+
+        if out_channel == 0:
+            out_channel = channels[self.first_level]
+
+        self.ida_up = IDAUp(out_channel, channels[self.first_level:self.last_level],
+                            [2 ** i for i in range(self.last_level - self.first_level)])
+
+        self.heads = heads
+        for head in self.heads:
+            classes = self.heads[head]
+            if head_conv > 0:
+                fc = nn.Sequential(
+                    nn.Conv2d(channels[self.first_level], head_conv,
+                              kernel_size=3, padding=1, bias=True),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(head_conv, classes,
+                              kernel_size=final_kernel, stride=1,
+                              padding=final_kernel // 2, bias=True))
+                if 'hm' in head:
+                    fc[-1].bias.data.fill_(-2.19)
+                else:
+                    fill_fc_weights(fc)
+            else:
+                fc = nn.Conv2d(channels[self.first_level], classes,
+                               kernel_size=final_kernel, stride=1,
+                               padding=final_kernel // 2, bias=True)
+                if 'hm' in head:
+                    fc.bias.data.fill_(-2.19)
+                else:
+                    fill_fc_weights(fc)
+            self.__setattr__(head, fc)
+        # #用来产生offset
+        # self.myconv = torch.nn.Conv2d(2,1,1)
+        self.eam  = EAM()
+        self.esam = ESAM()
+        self.efm2 = EFM(256)
+        self.efm1 = EFM(128)
+        self.efm0= EFM(64)
+        self.weights = ResNet(ResBlock)
+
+        
+    def forward(self, x, train=False):
+        rgb = x[:, :3, :, :]
+        x = rgb
+        #x = torch.tensor(rgb)
+        x = self.base(x)
+        
+        x = self.dla_up(x)
+        
+        y = []
+        for i in range(self.last_level - self.first_level):
+            y.append(x[i].clone())
+        z = {}
+        #边缘检测
+        contour = self.esam(x[3], x[0])
+        
+        #contour = self.eam(x[3], x[0])
+        #contour = torch.sigmoid(contour)
+
+        #x  0:64 128 128 1: 128 64 64  2:256 32 32 #512 16 16
+        #counter 1 128 128
+        #contour = self.esam(x[3], x[0])
+        #y 0:64 128 128 1:128 64 64 2:256 32 32
+        y[0] = self.efm0(y[0], contour)
+        y[1] = self.efm1(y[1], contour)
+        y[2] = self.efm2(y[2], contour)
+        
+        self.ida_up(y, 0, len(y))
+        # self.abida_up(ab, 0, len(ab))
+        # self.agida_up(angle, 0, len(angle))
+        
+        # all = torch.cat(y[:],1).clone()
+        # scrs = self.ccm(all).squeeze()
+        # scr,indx = scrs.topk(64)
+        # y[-1] = all[:,indx,:,:]
+        #y[-1] 64 128 128
+        for head in self.heads:
+            
+            z[head] = self.__getattr__(head)(y[-1])
+            
+        z['edge'] = contour  
+        
+        #z['mask'] = 
+        return z
+
+def MyNet(num_layers=34, heads={'hm': 1, 'ab': 2, 'ang': 1, 'reg': 2,'hm_top':1}, head_conv=256):
+    model = Creat_MyNet('dla{}'.format(num_layers), heads,
+                        pretrained=True,
+                        down_ratio=4,
+                        final_kernel=1,
+                        last_level=5,
+                        head_conv=head_conv)
+    return model

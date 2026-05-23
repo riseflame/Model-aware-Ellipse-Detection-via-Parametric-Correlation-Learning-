@@ -1,0 +1,11 @@
+opencv-python
+Cython
+numpy
+numba
+progress
+matplotlib
+easydict
+scipy
+tensorboardX
+tqdm
+pycocotools
