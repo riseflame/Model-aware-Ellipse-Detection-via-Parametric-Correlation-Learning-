@@ -5,7 +5,7 @@ This repository contains the official implementation of **Model-aware ellipse de
 The method detects ellipse instances by learning parametric correlations among ellipse geometry representations. It is designed for ellipse detection tasks where the output is represented by the center point, major/minor axes, and rotation angle.
 
 <div align="center">
-  <img src="net.png" width="800">
+  <img src="netfigure.png" width="800">
 </div>
 
 ## 1. Environment Configuration
